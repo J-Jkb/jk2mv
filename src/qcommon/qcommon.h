@@ -422,8 +422,20 @@ enum clc_ops_e {
 	clc_move,				// [[usercmd_t]
 	clc_moveNoDelta,		// [[usercmd_t]
 	clc_clientCommand,		// [string] message
+	clc_offlineJournal,		// v1: [byte version=1][int gapMsec][int cmdCount]
+							// v2: [byte version=2][int chunkIdx][int totalChunks][int payloadLen][bytes payload]
 	clc_EOF
 };
+
+// Offline-journal chunk protocol constants (engine + game VM both include this header)
+#define OJ_PROTOCOL_V1       1   // metadata-only (gapMsec + cmdCount)
+#define OJ_PROTOCOL_V2       2   // full journal (playerState + usercmds)
+#define OJ_CHUNK_SIZE        8192 // max payload bytes per clc_offlineJournal v2 packet
+// Binary buffer format for v2 (written to disk temp file for game-VM replay):
+//   [int32 OJ_MAGIC][int32 gapMsec][int32 totalCmds][int32 sizeof(playerState_t)]
+//   [playerState_t raw][usercmd_t × totalCmds raw, sorted by serverTime]
+#define OJ_MAGIC             0x4A4C4F4A // "JOLJ"
+#define OJ_TEMPFILE_FMT      "oj_replay_%d.bin" // slot-number suffix
 
 /*
 ==============================================================

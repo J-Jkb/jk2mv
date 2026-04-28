@@ -764,6 +764,14 @@ rescan:
 		return qtrue;
 	}
 
+	// Drive offline-journal chunk delivery: server acks each received chunk and
+	// tells the client which chunk to send next.
+	if ( !strcmp( cmd, "offlineJournalChunkAck" ) ) {
+		int nextChunk = atoi( Cmd_Argv( 1 ) );
+		CL_SendOfflineJournalChunk( nextChunk );
+		return qfalse; // engine-only, don't pass to cgame
+	}
+
 	// we may want to put a "connect to other server" command here
 
 	// cgame can now act on the command
@@ -2155,6 +2163,12 @@ void CL_FirstSnapshot( void ) {
 	RE_RegisterMedia_LevelLoadEnd();
 
 	cls.state = CA_ACTIVE;
+
+	// If the player survived a server timeout by buffering moves locally,
+	// notify the server now that we have a live connection again.
+	if ( cl_pendingOfflineJournal ) {
+		CL_SendOfflineJournal();
+	}
 
 	WIN_SetTaskbarState(TBS_NOTIFY, 0, 0);
 

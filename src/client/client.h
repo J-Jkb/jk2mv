@@ -286,6 +286,11 @@ typedef struct {
 
 	qboolean	gotInfo;
 	qboolean	gotStatus;
+
+	// Set when the server connection times out but we want to keep the run alive locally.
+	// Usercmds continue to be journaled into clUserMessages; the actual network transmit
+	// is suppressed until reconnection logic clears this flag.
+	qboolean	offlineJournaling;
 } clientConnection_t;
 
 extern	clientConnection_t clc;
@@ -689,6 +694,16 @@ void CL_ShutdownAll(void);
 void CL_AddReliableCommand( const char *cmd );
 void CL_ConfigstringModified(void);
 void CL_AddUserMessage(userMessage_t* umsg);
+void CL_SendOfflineJournal( void );
+
+extern qboolean	cl_pendingOfflineJournal;
+extern int		cl_offlineJournalStartRealtime;
+extern int		cl_offlineJournalCmdCount;
+extern int		cl_offlineJournalNextReconnectTime;
+// v2 journal transmission state
+void CL_SerializeOfflineJournal( void );
+void CL_SendOfflineJournalChunk( int chunkIdx );
+void CL_CheckOfflineJournalGiveUp( void );
 
 #define CL_EZDEMO
 

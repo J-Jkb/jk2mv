@@ -7,6 +7,8 @@
 #include "snd_local.h"
 #include <mv_setup.h>
 #include <memory>
+#include <map>
+#include <vector>
 #include <sstream>
 #include <ctime>
 
@@ -29,6 +31,17 @@ clientRendererInfo_t	clRenderInfo;
 std::vector<std::unique_ptr<userMessage_t>> clUserMessages;
 int userStoredUcmdCount = 0;
 
+// Offline journal state -- persists across reconnect intentionally (not part of cl or clc).
+// Set when a timeout-level gap is absorbed locally instead of dropping the client.
+// Cleared once the journal notification is successfully delivered to the server.
+qboolean	cl_pendingOfflineJournal = qfalse;
+int			cl_offlineJournalStartRealtime = 0;		// cls.realtime when offline journaling began
+int			cl_offlineJournalCmdCount = 0;			// usercmds recorded during the offline period
+int			cl_offlineJournalNextReconnectTime = 0;	// cls.realtime when the next auto-reconnect should fire
+// v2 journal binary payload: [header][playerState_t raw][usercmd_t × N raw]
+static std::vector<byte> cl_offlineJournalSendBuf;
+static int cl_offlineJournalTotalChunks = 0;	// total chunks to send
+
 //#define NOCONNECT
 
 cvar_t	*cl_nodelta;
@@ -41,6 +54,8 @@ cvar_t	*rcon_client_password;
 cvar_t	*rconAddress;
 
 cvar_t	*cl_timeout;
+cvar_t	*cl_offlineJournalAutoReconnect;
+cvar_t	*cl_offlineJournalMaxGapSec;
 cvar_t	*cl_maxpackets;
 cvar_t	*cl_maxPacketUserCmds;
 cvar_t	*cl_dynamicUserPacket;
@@ -489,6 +504,224 @@ CLIENT RELIABLE COMMAND COMMUNICATION
 
 =======================================================================
 */
+
+/*
+======================
+CL_SerializeOfflineJournal
+
+Snapshot cl.snap.ps and all buffered usercmds from clUserMessages into
+cl_offlineJournalSendBuf so the data survives the upcoming CL_Disconnect
+(which wipes cl and clc).  Must be called BEFORE Cbuf_AddText("connect").
+
+Buffer layout:
+  [int32 OJ_MAGIC][int32 gapMsec][int32 totalCmds][int32 sizeof(ps)]
+  [playerState_t raw][usercmd_t × totalCmds raw, sorted by serverTime]
+======================
+*/
+void CL_SerializeOfflineJournal( void ) {
+	if ( !cl_offlineJournalSendBuf.empty() ) {
+		return; // already serialized on a previous reconnect attempt
+	}
+
+	// Collect all unique usercmds by serverTime (deduplicate across packet redundancy).
+	std::map<int, usercmd_t> uniqueCmds;
+	for ( const auto &msg : clUserMessages ) {
+		for ( const auto &cmd : msg->cmds ) {
+			if ( uniqueCmds.find( cmd->serverTime ) == uniqueCmds.end() ) {
+				uniqueCmds[cmd->serverTime] = *cmd;
+			}
+		}
+	}
+
+	int totalCmds = (int)uniqueCmds.size();
+	int gapMsec   = cls.realtime - cl_offlineJournalStartRealtime;
+	if ( gapMsec < 0 ) gapMsec = 0;
+
+	int psSize = (int)sizeof( playerState_t );
+
+	// Header: magic + gapMsec + totalCmds + psSize
+	int headerSize = 4 * 4;
+	int totalSize  = headerSize + psSize + totalCmds * (int)sizeof( usercmd_t );
+
+	cl_offlineJournalSendBuf.resize( totalSize );
+	byte *p = cl_offlineJournalSendBuf.data();
+
+	// Write header (little-endian int32 fields)
+	auto writeI32 = [&]( int v ) {
+		memcpy( p, &v, 4 );
+		p += 4;
+	};
+	int magic = OJ_MAGIC;
+	writeI32( magic );
+	writeI32( gapMsec );
+	writeI32( totalCmds );
+	writeI32( psSize );
+
+	// Write playerState snapshot
+	memcpy( p, &cl.snap.ps, psSize );
+	p += psSize;
+
+	// Write usercmds sorted by serverTime
+	for ( const auto &kv : uniqueCmds ) {
+		memcpy( p, &kv.second, sizeof( usercmd_t ) );
+		p += sizeof( usercmd_t );
+	}
+
+	// Compute chunk count
+	int payloadTotal = totalSize;
+	cl_offlineJournalTotalChunks = ( payloadTotal + OJ_CHUNK_SIZE - 1 ) / OJ_CHUNK_SIZE;
+	if ( cl_offlineJournalTotalChunks < 1 ) cl_offlineJournalTotalChunks = 1;
+
+	Com_Printf( "^3[OfflineJournal] Serialized: %dms gap, %d cmds, %d bytes (%d chunks).\n",
+				gapMsec, totalCmds, totalSize, cl_offlineJournalTotalChunks );
+}
+
+/*
+======================
+CL_SendOfflineJournalChunk
+
+Sends a single chunk of the pre-serialized journal buffer as a
+clc_offlineJournal v2 packet.  When the last chunk is sent the
+journaling globals are cleared.
+======================
+*/
+void CL_SendOfflineJournalChunk( int chunkIdx ) {
+	if ( cl_offlineJournalSendBuf.empty() || cls.state < CA_ACTIVE ) {
+		return;
+	}
+
+	int bufLen       = (int)cl_offlineJournalSendBuf.size();
+	int totalChunks  = cl_offlineJournalTotalChunks;
+	int payloadStart = chunkIdx * OJ_CHUNK_SIZE;
+
+	if ( payloadStart >= bufLen ) {
+		return; // out of range
+	}
+
+	int payloadLen = bufLen - payloadStart;
+	if ( payloadLen > OJ_CHUNK_SIZE ) payloadLen = OJ_CHUNK_SIZE;
+
+	// Build packet: standard header + clc_offlineJournal v2 + chunk fields + payload
+	static byte rawBuf[OJ_CHUNK_SIZE + 64];
+	msg_t buf;
+	MSG_Init( &buf, rawBuf, sizeof( rawBuf ) );
+	MSG_Bitstream( &buf );
+
+	MSG_WriteLong( &buf, cl.serverId );
+	MSG_WriteLong( &buf, clc.serverMessageSequence );
+	MSG_WriteLong( &buf, clc.serverCommandSequence );
+
+	MSG_WriteByte( &buf, clc_offlineJournal );
+	MSG_WriteByte( &buf, OJ_PROTOCOL_V2 );
+	MSG_WriteLong( &buf, chunkIdx );
+	MSG_WriteLong( &buf, totalChunks );
+	MSG_WriteLong( &buf, payloadLen );
+	MSG_WriteData( &buf, cl_offlineJournalSendBuf.data() + payloadStart, payloadLen );
+	MSG_WriteByte( &buf, clc_EOF );
+
+	CL_Netchan_Transmit( &clc.netchan, &buf );
+	// Flush all netchan fragments synchronously so the next chunk send
+	// doesn't stomp an incomplete fragmented packet.
+	while ( clc.netchan.unsentFragments ) {
+		CL_Netchan_TransmitNextFragment( &clc.netchan );
+	}
+
+	Com_Printf( "^3[OfflineJournal] Sent chunk %d/%d (%d bytes).\n",
+				chunkIdx + 1, totalChunks, payloadLen );
+
+	// If this was the last chunk, clean up the client-side journal state.
+	if ( chunkIdx == totalChunks - 1 ) {
+		cl_pendingOfflineJournal        = qfalse;
+		cl_offlineJournalTotalChunks    = 0;
+		cl_offlineJournalSendBuf.clear();
+		Cvar_Set( "cl_offlineJournalingActive", "0" );
+		Com_Printf( "^3[OfflineJournal] All chunks sent.\n" );
+	}
+}
+
+/*
+======================
+CL_CheckOfflineJournalGiveUp
+
+Called every frame while a reconnect is in progress.  If the server
+has not come back within cl_offlineJournalMaxGapSec the pending journal
+is discarded and the connection attempt is aborted.
+======================
+*/
+void CL_CheckOfflineJournalGiveUp( void ) {
+	int gapMsec;
+
+	if ( !cl_pendingOfflineJournal || cls.state == CA_ACTIVE ) {
+		return; // not pending, or still in fake-active offline mode (CL_CheckTimeout handles that)
+	}
+
+	if ( cl_offlineJournalMaxGapSec->value <= 0 ) {
+		return; // disabled
+	}
+
+	gapMsec = cls.realtime - cl_offlineJournalStartRealtime;
+	if ( gapMsec <= (int)( cl_offlineJournalMaxGapSec->value * 1000 ) ) {
+		return;
+	}
+
+	Com_Printf( "^3[OfflineJournal] Server unavailable for %ds - run aborted.\n",
+				gapMsec / 1000 );
+
+	cl_pendingOfflineJournal     = qfalse;
+	cl_offlineJournalCmdCount    = 0;
+	cl_offlineJournalStartRealtime = 0;
+	cl_offlineJournalNextReconnectTime = 0;
+	cl_offlineJournalTotalChunks = 0;
+	cl_offlineJournalSendBuf.clear();
+	Cvar_Set( "cl_offlineJournalingActive", "0" );
+	CL_Disconnect( qtrue );
+}
+
+/*
+======================
+CL_SendOfflineJournal
+
+Entry point called from CL_FirstSnapshot on reconnect.  If a v2 payload
+buffer was pre-serialized, sends chunk 0 and lets the server-ack flow
+drive the remaining chunks.  Falls back to a v1 metadata-only packet if
+no buffer was built (e.g. the player wasn't recording a run).
+======================
+*/
+void CL_SendOfflineJournal( void ) {
+	if ( cls.state < CA_ACTIVE ) {
+		return;
+	}
+
+	if ( !cl_offlineJournalSendBuf.empty() ) {
+		// v2 path: send first chunk; subsequent ones are triggered by server acks.
+		CL_SendOfflineJournalChunk( 0 );
+		return;
+	}
+
+	// v1 fallback: metadata-only (no run was active or serialization was skipped).
+	msg_t	buf;
+	byte	data[32];
+	int		gapMsec = cls.realtime - cl_offlineJournalStartRealtime;
+	if ( gapMsec < 0 ) gapMsec = 0;
+
+	MSG_Init( &buf, data, sizeof(data) );
+	MSG_Bitstream( &buf );
+	MSG_WriteLong( &buf, cl.serverId );
+	MSG_WriteLong( &buf, clc.serverMessageSequence );
+	MSG_WriteLong( &buf, clc.serverCommandSequence );
+	MSG_WriteByte( &buf, clc_offlineJournal );
+	MSG_WriteByte( &buf, OJ_PROTOCOL_V1 );
+	MSG_WriteLong( &buf, gapMsec );
+	MSG_WriteLong( &buf, cl_offlineJournalCmdCount );
+	MSG_WriteByte( &buf, clc_EOF );
+	CL_Netchan_Transmit( &clc.netchan, &buf );
+
+	Com_Printf( "^3[OfflineJournal] Sent v1 metadata: %dms gap, %d cmds.\n",
+				gapMsec, cl_offlineJournalCmdCount );
+
+	cl_pendingOfflineJournal = qfalse;
+	Cvar_Set( "cl_offlineJournalingActive", "0" );
+}
 
 /*
 ======================
@@ -3153,11 +3386,32 @@ void CL_CheckTimeout( void ) {
 		&& cls.state >= CA_CONNECTED && cls.state != CA_CINEMATIC
 	    && cls.realtime - clc.lastPacketTime > cl_timeout->value*1000) {
 		if (++cl.timeoutcount > 5) {	// timeoutcount saves debugger
-			const char *psTimedOut = SP_GetStringTextString("SVINGAME_SERVER_CONNECTION_TIMED_OUT");
-			Com_Printf ("\n%s\n",psTimedOut);
-			Com_Error(ERR_DROP, "%s", psTimedOut);
-			//CL_Disconnect( qtrue );
-			return;
+			if ( !clc.offlineJournaling ) {
+				// First time crossing the threshold: enter offline journaling mode.
+				clc.offlineJournaling = qtrue;
+				cl_pendingOfflineJournal = qtrue;
+				cl_offlineJournalStartRealtime = cls.realtime;
+				cl_offlineJournalCmdCount = 0;
+				// Schedule the first reconnect attempt 3 s from now.
+				cl_offlineJournalNextReconnectTime = cls.realtime + 3000;
+				// Signal the cgame HUD indicator.
+				Cvar_Set( "cl_offlineJournalingActive", "1" );
+				Com_Printf( "^3Server connection timed out - buffering moves offline. Run will be marked 'Network Interference' on reconnect.\n" );
+			} else if ( cl_offlineJournalAutoReconnect->integer
+					&& cls.realtime >= cl_offlineJournalNextReconnectTime
+					&& cls.servername[0]
+					&& Q_stricmp( cls.servername, "localhost" ) != 0 ) {
+				// Already in offline mode: periodically attempt to reconnect.
+				// Serialize the journal NOW while cl.snap.ps and clUserMessages are
+				// still valid.  CL_Disconnect (triggered by the connect command) will
+				// wipe both, so this must happen first.
+				CL_SerializeOfflineJournal();
+				cl_offlineJournalNextReconnectTime = cls.realtime + 5000;
+				Com_Printf( "^3[OfflineJournal] Reconnect attempt (%s)...\n", cls.servername );
+				Cbuf_AddText( va( "connect %s\n", cls.servername ) );
+			}
+			// Do NOT fall through to Com_Error: keep the frame loop and physics
+			// running so the player can continue their run.
 		}
 	} else {
 		cl.timeoutcount = 0;
@@ -3369,6 +3623,9 @@ void CL_Frame ( int msec ) {
 
 	// resend a connection request if necessary
 	CL_CheckForResend();
+
+	// abort offline journal if the server stays down too long
+	CL_CheckOfflineJournalGiveUp();
 
 	// decide on the serverTime to render
 	CL_SetCGameTime();
@@ -3715,6 +3972,8 @@ void CL_Init( void ) {
 	cl_motd = Cvar_Get ("cl_motd", "1", 0);
 
 	cl_timeout = Cvar_Get ("cl_timeout", "200", 0);
+	cl_offlineJournalAutoReconnect = Cvar_Get ("cl_offlineJournalAutoReconnect", "1", CVAR_ARCHIVE);
+	cl_offlineJournalMaxGapSec     = Cvar_Get ("cl_offlineJournalMaxGapSec",     "120", CVAR_ARCHIVE);
 
 	cl_timeNudge = Cvar_Get ("cl_timeNudge", "0", CVAR_TEMP );
 	cl_timeNudgeAntiLagHack = Cvar_Get ("cl_timeNudgeAntiLagHack", "1", CVAR_CHEAT );

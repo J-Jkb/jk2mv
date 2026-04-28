@@ -5,6 +5,8 @@
 unsigned	frame_msec;
 int			old_com_frameTime;
 
+extern int cl_offlineJournalCmdCount;
+
 //valar how often to cycle to get to the saberstyle we want
 extern int saberCycleThisManyTimes = 0;
 extern int cycledThisframe = 0;
@@ -1533,7 +1535,7 @@ void CL_WritePacket( void ) {
 		return;
 	}
 
-	if (cl_ucmdDemoSave->integer && clc.demorecording && !clc.demowaiting) {
+	if ((cl_ucmdDemoSave->integer && clc.demorecording && !clc.demowaiting) || clc.offlineJournaling) {
 		umsg = new userMessage_t();
 		umsg->serverTime = cl.snap.serverTime;
 		umsg->droppedPackets = clc.netchan.droppedSinceClear;
@@ -1667,6 +1669,9 @@ void CL_WritePacket( void ) {
 				std::unique_ptr<usercmd_t> tmp = std::make_unique<usercmd_t>();
 				*tmp = *cmd;
 				umsg->cmds.push_back(std::move(tmp));
+				if ( clc.offlineJournaling ) {
+					cl_offlineJournalCmdCount++;
+				}
 			}
 			MSG_WriteDeltaUsercmdKey (&buf, key, oldcmd, cmd);
 			oldcmd = cmd;
@@ -1687,18 +1692,22 @@ void CL_WritePacket( void ) {
 		Com_Printf( "%i ", buf.cursize );
 	}
 
-	CL_Netchan_Transmit (&clc.netchan, &buf);
+	if ( !clc.offlineJournaling ) {
+		CL_Netchan_Transmit (&clc.netchan, &buf);
+	}
 
 	if (umsg) {
-		// for usercommand saving to demos
+		// for usercommand saving to demos (and offline journal)
 		CL_AddUserMessage(umsg);
 	}
 
 	// clients never really should have messages large enough
 	// to fragment, but in case they do, fire them all off
 	// at once
-	while ( clc.netchan.unsentFragments ) {
-		CL_Netchan_TransmitNextFragment( &clc.netchan );
+	if ( !clc.offlineJournaling ) {
+		while ( clc.netchan.unsentFragments ) {
+			CL_Netchan_TransmitNextFragment( &clc.netchan );
+		}
 	}
 }
 

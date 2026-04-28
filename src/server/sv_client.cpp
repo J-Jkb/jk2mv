@@ -410,6 +410,16 @@ void SV_DropClient( client_t *drop, const char *reason ) {
 	SV_CloseDownload( drop );
 	NET_HTTP_DenyClient( drop - svs.clients );
 
+	// Free any partially-assembled offline journal buffer.
+	if ( drop->offlineJournalBuf ) {
+		Z_Free( drop->offlineJournalBuf );
+		drop->offlineJournalBuf         = NULL;
+		drop->offlineJournalBufLen      = 0;
+		drop->offlineJournalBufTotal    = 0;
+		drop->offlineJournalChunksTotal = 0;
+		drop->offlineJournalChunksRecv  = 0;
+	}
+
 	// tell everyone why they got dropped
 	SV_SendServerCommand( NULL, "print \"%s" S_COLOR_WHITE " %s\n\"", drop->name, reason );
 
@@ -1789,6 +1799,175 @@ SV_ExecuteClientMessage
 Parse a client packet
 ===================
 */
+/*
+====================
+SV_HandleOfflineJournal
+
+Handles clc_offlineJournal packets from a client that survived a timeout by
+buffering moves locally.
+
+  v1 (OJ_PROTOCOL_V1): metadata-only (gapMsec + cmdCount).  Stores on the
+  client slot and notifies the game VM via 'offlineJournal' synthetic command.
+
+  v2 (OJ_PROTOCOL_V2): chunked binary payload carrying a full playerState
+  snapshot plus the raw usercmd sequence.  Chunks are reassembled into a
+  temporary disk file; once complete, GAME_OFFLINE_JOURNAL_REPLAY is called
+  so the game VM can run a server-side Pmove replay and record the run.
+====================
+*/
+static void SV_HandleOfflineJournal( client_t *cl, msg_t *msg ) {
+	int version = MSG_ReadByte( msg );
+	int clientSlot = (int)( cl - svs.clients );
+
+	if ( version == OJ_PROTOCOL_V1 ) {
+		// ------ v1: metadata-only path ------
+		int gapMsec  = MSG_ReadLong( msg );
+		int cmdCount = MSG_ReadLong( msg );
+
+		if ( gapMsec < 0 || cmdCount < 0 ) {
+			Com_Printf( "SV_HandleOfflineJournal: bad v1 data from %s (gap=%d cmds=%d)\n",
+						cl->name, gapMsec, cmdCount );
+			return;
+		}
+
+		Com_Printf( "^3[OfflineJournal] %s: v1 metadata %dms gap (%d cmds).\n",
+					cl->name, gapMsec, cmdCount );
+
+		cl->offlineJournalReceived = qtrue;
+		cl->offlineJournalGapMsec  = gapMsec;
+		cl->offlineJournalCmdCount = cmdCount;
+
+		if ( gvm && cl->state == CS_ACTIVE ) {
+			Cmd_TokenizeString( va( "offlineJournal %d %d", gapMsec, cmdCount ) );
+			VM_Call( gvm, GAME_CLIENT_COMMAND, clientSlot );
+		}
+		return;
+	}
+
+	if ( version != OJ_PROTOCOL_V2 ) {
+		Com_Printf( "SV_HandleOfflineJournal: unknown version %d from %s\n", version, cl->name );
+		return;
+	}
+
+	// ------ v2: chunked binary path ------
+	int chunkIdx    = MSG_ReadLong( msg );
+	int totalChunks = MSG_ReadLong( msg );
+	int payloadLen  = MSG_ReadLong( msg );
+
+	if ( chunkIdx < 0 || totalChunks < 1 || payloadLen < 0
+		|| chunkIdx >= totalChunks || payloadLen > OJ_CHUNK_SIZE + 64 ) {
+		Com_Printf( "SV_HandleOfflineJournal: malformed v2 chunk from %s "
+					"(chunk=%d/%d payloadLen=%d)\n",
+					cl->name, chunkIdx, totalChunks, payloadLen );
+		return;
+	}
+
+	// On the first chunk allocate the assembly buffer.
+	if ( chunkIdx == 0 ) {
+		if ( cl->offlineJournalBuf ) {
+			Z_Free( cl->offlineJournalBuf );
+			cl->offlineJournalBuf = NULL;
+		}
+		int bufTotal = totalChunks * OJ_CHUNK_SIZE;
+		cl->offlineJournalBuf         = (byte *)Z_Malloc( bufTotal, TAG_GENERAL, qfalse );
+		cl->offlineJournalBufLen      = 0;
+		cl->offlineJournalBufTotal    = bufTotal;
+		cl->offlineJournalChunksTotal = totalChunks;
+		cl->offlineJournalChunksRecv  = 0;
+	}
+
+	if ( !cl->offlineJournalBuf ) {
+		Com_Printf( "SV_HandleOfflineJournal: out-of-order v2 chunk (no buffer) from %s\n", cl->name );
+		return;
+	}
+
+	// Copy payload into the assembly buffer at its correct offset.
+	int offset = chunkIdx * OJ_CHUNK_SIZE;
+	if ( offset + payloadLen > cl->offlineJournalBufTotal ) {
+		Com_Printf( "SV_HandleOfflineJournal: chunk overflows buffer from %s\n", cl->name );
+		return;
+	}
+
+	MSG_ReadData( msg, cl->offlineJournalBuf + offset, payloadLen );
+	cl->offlineJournalChunksRecv++;
+	// Track how many meaningful bytes are in the buffer.
+	int end = offset + payloadLen;
+	if ( end > cl->offlineJournalBufLen ) cl->offlineJournalBufLen = end;
+
+	Com_Printf( "^3[OfflineJournal] %s chunk %d/%d (%d bytes).\n",
+				cl->name, chunkIdx + 1, totalChunks, payloadLen );
+
+	if ( cl->offlineJournalChunksRecv < cl->offlineJournalChunksTotal ) {
+		// Not done yet; ack so the client sends the next chunk.
+		SV_SendServerCommand( cl, "offlineJournalChunkAck %d", chunkIdx + 1 );
+		return;
+	}
+
+	// ---- All chunks received ---- //
+
+	// Read header from the assembled buffer to get gapMsec and cmdCount.
+	if ( cl->offlineJournalBufLen < 16 ) {
+		Com_Printf( "SV_HandleOfflineJournal: assembly too short from %s (%d bytes)\n",
+					cl->name, cl->offlineJournalBufLen );
+		goto cleanup;
+	}
+
+	{
+		byte *p       = cl->offlineJournalBuf;
+		int magic     = *(int *)p; p += 4;
+		int gapMsec   = *(int *)p; p += 4;
+		int cmdCount  = *(int *)p; p += 4;
+		/* int psSize = */ p += 4; // skip for now
+
+		if ( magic != OJ_MAGIC ) {
+			Com_Printf( "SV_HandleOfflineJournal: bad magic from %s (0x%08X)\n",
+						cl->name, magic );
+			goto cleanup;
+		}
+
+		Com_Printf( "^3[OfflineJournal] %s: v2 complete -- %dms gap, %d cmds, %d bytes.\n",
+					cl->name, gapMsec, cmdCount, cl->offlineJournalBufLen );
+
+		cl->offlineJournalReceived = qtrue;
+		cl->offlineJournalGapMsec  = gapMsec;
+		cl->offlineJournalCmdCount = cmdCount;
+
+		// Write the assembled buffer to a temp file the game VM can read.
+		char tempPath[64];
+		Com_sprintf( tempPath, sizeof(tempPath), OJ_TEMPFILE_FMT, clientSlot );
+		fileHandle_t fh = FS_FOpenFileWrite( tempPath );
+		if ( !fh ) {
+			Com_Printf( "SV_HandleOfflineJournal: could not write temp file %s\n", tempPath );
+			// Fall back to v1-style metadata notification.
+			if ( gvm && cl->state == CS_ACTIVE ) {
+				Cmd_TokenizeString( va( "offlineJournal %d %d", gapMsec, cmdCount ) );
+				VM_Call( gvm, GAME_CLIENT_COMMAND, clientSlot );
+			}
+			goto cleanup;
+		}
+		FS_Write( cl->offlineJournalBuf, cl->offlineJournalBufLen, fh );
+		FS_FCloseFile( fh );
+
+		// Notify game VM: first tag the run, then trigger full replay.
+		if ( gvm && cl->state == CS_ACTIVE ) {
+			Cmd_TokenizeString( va( "offlineJournal %d %d", gapMsec, cmdCount ) );
+			VM_Call( gvm, GAME_CLIENT_COMMAND, clientSlot );
+
+			VM_Call( gvm, GAME_OFFLINE_JOURNAL_REPLAY, clientSlot );
+		}
+	}
+
+cleanup:
+	if ( cl->offlineJournalBuf ) {
+		Z_Free( cl->offlineJournalBuf );
+		cl->offlineJournalBuf = NULL;
+	}
+	cl->offlineJournalBufLen       = 0;
+	cl->offlineJournalBufTotal     = 0;
+	cl->offlineJournalChunksTotal  = 0;
+	cl->offlineJournalChunksRecv   = 0;
+}
+
 void SV_ExecuteClientMessage( client_t *cl, msg_t *msg ) {
 	int			c;
 	int			serverId;
@@ -1881,6 +2060,8 @@ void SV_ExecuteClientMessage( client_t *cl, msg_t *msg ) {
 		SV_UserMove( cl, msg, qtrue, umsg );
 	} else if ( c == clc_moveNoDelta ) {
 		SV_UserMove( cl, msg, qfalse, umsg );
+	} else if ( c == clc_offlineJournal ) {
+		SV_HandleOfflineJournal( cl, msg );
 	} else if ( c != clc_EOF ) {
 		Com_Printf( "WARNING: bad command byte for client %i\n", (int)(cl - svs.clients) );
 	}

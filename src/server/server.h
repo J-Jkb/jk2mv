@@ -257,6 +257,19 @@ typedef struct client_s {
 
 	qboolean		zombified;
 	int				customSnapEntCount; // client requested to not have the snapshot entity count limited to 256
+
+	// Set when the engine receives a clc_offlineJournal packet from this client after a timeout-reconnect.
+	// The game VM is notified via GAME_CLIENT_COMMAND so it can categorise the run.
+	qboolean		offlineJournalReceived;
+	int				offlineJournalGapMsec;	// duration of the offline gap reported by the client
+	int				offlineJournalCmdCount;	// number of usercmds buffered during the offline period
+
+	// v2 journal: chunked binary assembly buffer
+	byte			*offlineJournalBuf;		// heap-allocated; freed after VM replay or on disconnect
+	int				offlineJournalBufLen;	// bytes received so far
+	int				offlineJournalBufTotal;	// expected total size (computed from chunk 0)
+	int				offlineJournalChunksTotal;  // expected total chunk count
+	int				offlineJournalChunksRecv;   // chunks received so far
 } client_t;
 
 //=============================================================================
